@@ -17,7 +17,7 @@ For pairs that clear the minimum edge it then:
 Usage:
     python3 arb_scanner.py                  # default settings
     python3 arb_scanner.py --min-edge 0.01 --min-sim 0.6
-    python3 arb_scanner.py --poly-fee 0.0   # if your Polymarket account has no fees
+    python3 arb_scanner.py --poly-fee 0     # ignore Polymarket's per-market taker fees
     python3 arb_scanner.py --no-depth       # skip order book lookups (faster)
 
 Outputs:
@@ -45,7 +45,7 @@ from datetime import datetime, timezone
 from difflib import SequenceMatcher
 
 KALSHI_URL = "https://api.elections.kalshi.com/trade-api/v2/markets"
-POLY_URL = "https://gamma-api.polymarket.com/markets"
+POLY_URL = "https://gamma-api.polymarket.com/events/keyset"
 KALSHI_BOOK_URL = "https://api.elections.kalshi.com/trade-api/v2/markets/{}/orderbook"
 POLY_BOOK_URL = "https://clob.polymarket.com/book"
 UA = {"User-Agent": "arb-scanner/1.0", "Accept": "application/json"}
@@ -73,11 +73,13 @@ def num(x):
         return None
 
 
-def fetch_kalshi(max_pages=30):
+def fetch_kalshi(max_pages=300):
     """Open Kalshi markets with YES/NO ask prices in dollars."""
     out, cursor = [], None
-    for _ in range(max_pages):
-        params = {"status": "open", "limit": 1000}
+    for page in range(1, max_pages + 1):
+        # Without mve_filter the list is flooded with 100k+ multi-leg parlay
+        # markets (KXMVE...) that have no Polymarket equivalent.
+        params = {"status": "open", "limit": 1000, "mve_filter": "exclude"}
         if cursor:
             params["cursor"] = cursor
         data = get_json(KALSHI_URL, params)
@@ -99,30 +101,41 @@ def fetch_kalshi(max_pages=30):
                 "site": "Kalshi",
                 "id": m.get("ticker"),
                 "title": title,
+                "sub": sub,
                 "yes_ask": ya,
                 "no_ask": na,
                 "close": m.get("close_time") or m.get("expiration_time"),
                 "url": f"https://kalshi.com/markets/{(m.get('event_ticker') or m.get('ticker') or '').lower()}",
-                "volume": num(m.get("volume")) or 0,
+                "volume": num(m.get("volume_fp")) or num(m.get("volume")) or 0,
                 "rules": "\n\n".join(filter(None, [m.get("rules_primary"), m.get("rules_secondary")])),
                 "strikes": [s for s in (num(m.get("floor_strike")), num(m.get("cap_strike"))) if s is not None],
             })
         cursor = data.get("cursor")
-        print(f"  Kalshi: {len(out)} markets so far", file=sys.stderr)
+        if page % 20 == 0 or not cursor:
+            print(f"  Kalshi: {len(out)} markets so far", file=sys.stderr)
         if not cursor:
             break
     return out
 
 
-def fetch_polymarket(max_pages=40):
-    """Open binary Polymarket markets with YES/NO ask prices."""
-    out, offset, page = [], 0, 500
-    for _ in range(max_pages):
-        data = get_json(POLY_URL, {"active": "true", "closed": "false",
-                                   "limit": page, "offset": offset})
-        if not data:
-            break
-        for m in data:
+def fetch_polymarket(max_pages=1000):
+    """Open binary Polymarket markets with YES/NO ask prices.
+
+    Walks Gamma's events keyset endpoint (100 events/page, each with its
+    markets nested). /markets caps limit at 100 and rejects offsets past
+    ~2000 with HTTP 422, so offset paging only reached a sliver of the
+    ~300k open markets; going by event needs ~12x fewer requests.
+    """
+    out, cursor = [], None
+    for page in range(1, max_pages + 1):
+        params = {"active": "true", "closed": "false", "limit": 100}
+        if cursor:
+            params["after_cursor"] = cursor
+        data = get_json(POLY_URL, params)
+        for ev, m in ((ev, m) for ev in data.get("events", []) for m in ev.get("markets") or []):
+            # Nested markets include closed/paused ones; keep only tradeable
+            if not m.get("active") or m.get("closed") or not m.get("acceptingOrders"):
+                continue
             try:
                 outcomes = json.loads(m.get("outcomes") or "[]")
             except json.JSONDecodeError:
@@ -137,22 +150,28 @@ def fetch_polymarket(max_pages=40):
                 tokens = json.loads(m.get("clobTokenIds") or "[]")
             except json.JSONDecodeError:
                 tokens = []
+            # Taker fee is set per market: rate * p * (1 - p) per share, in USDC
+            sched = m.get("feeSchedule") or {}
+            fee_rate = (num(sched.get("rate")) or 0) if m.get("feesEnabled") else 0
             out.append({
                 "site": "Polymarket",
                 "id": m.get("slug") or m.get("id"),
                 "title": m.get("question") or "",
+                "event": ev.get("title") or "",
                 "yes_ask": best_ask,
                 "no_ask": round(1 - best_bid, 4),
-                "close": m.get("endDate"),
+                "close": m.get("endDate") or ev.get("endDate"),
                 "url": f"https://polymarket.com/market/{m.get('slug', '')}",
                 "volume": num(m.get("volume")) or 0,
-                "rules": m.get("description") or "",
-                "source": m.get("resolutionSource") or "",
+                "rules": m.get("description") or ev.get("description") or "",
+                "source": m.get("resolutionSource") or ev.get("resolutionSource") or "",
                 "yes_token": tokens[0] if tokens else None,  # order matches outcomes: [Yes, No]
+                "fee_rate": fee_rate,
             })
-        offset += page
-        print(f"  Polymarket: {len(out)} markets so far", file=sys.stderr)
-        if len(data) < page:
+        cursor = data.get("next_cursor")
+        if page % 25 == 0 or not cursor:
+            print(f"  Polymarket: {len(out)} markets so far", file=sys.stderr)
+        if not cursor:
             break
     return out
 
@@ -198,22 +217,32 @@ def similarity(a, b):
 
 def match(kalshi, poly, min_sim, max_days):
     # Index Polymarket by keyword so we don't compare every pair
+    words = [set(norm(p["title"])) for p in poly]
+    closes = [parse_dt(p["close"]) for p in poly]
     index = {}
-    for i, p in enumerate(poly):
-        for w in set(norm(p["title"])):
+    for i, ws in enumerate(words):
+        for w in ws:
             if len(w) > 3:
-                index.setdefault(w, set()).add(i)
+                index.setdefault(w, []).append(i)
+    # Words like "2026" or "score" appear in 10k+ Polymarket titles; looking
+    # them up makes every Kalshi market compare against most of Polymarket
+    # (hours on the live data). Use only rarer words, or the single rarest.
+    max_df = max(200, len(poly) // 100)
     pairs = []
     for k in kalshi:
-        cand = set()
-        for w in set(norm(k["title"])):
-            if len(w) > 3:
-                cand |= index.get(w, set())
+        ka = set(norm(k["title"]))
+        kw = sorted((w for w in ka if len(w) > 3 and w in index), key=lambda w: len(index[w]))
+        rare = [w for w in kw if len(index[w]) <= max_df] or kw[:1]
+        cand = set().union(*(index[w] for w in rare))
+        kd = parse_dt(k["close"])
         best = None
         for i in cand:
-            p = poly[i]
-            kd, pd = parse_dt(k["close"]), parse_dt(p["close"])
+            p, pd = poly[i], closes[i]
             if kd and pd and abs((kd - pd).days) > max_days:
+                continue
+            # similarity() <= 0.6 * jaccard + 0.4, so skip the slow
+            # SequenceMatcher when the word overlap alone can't get there
+            if 0.6 * len(ka & words[i]) / len(ka | words[i]) + 0.4 < min_sim:
                 continue
             s = similarity(k, p)
             if s >= min_sim and (best is None or s > best[0]):
@@ -236,6 +265,77 @@ SOURCES = {
     "Bloomberg": r"bloomberg", "Reuters": r"reuters", "Yahoo Finance": r"yahoo finance",
     "ESPN": r"\bespn\b", "Wikipedia": r"wikipedia", "Box Office Mojo": r"box office mojo",
 }
+
+
+# Words that decide what a market is asking. Synonyms map to one key so
+# "decrease" vs "cut" still agrees; any key in one title but not the other
+# (e.g. Kalshi "maintain" vs Polymarket "increase") means a different question.
+OUTCOME_WORDS = {
+    "cut": "cut", "decrease": "cut", "lower": "cut", "reduce": "cut", "hike": "hike",
+    "increase": "hike", "raise": "hike", "maintain": "hold", "hold": "hold",
+    "unchanged": "hold", "pause": "hold", "change": "hold", "win": "win", "qualify": "qualify",
+    "advance": "qualify", "finale": "finale", "final": "final",
+    "relegate": "relegate", "relegated": "relegate", "top": "top", "bottom": "bottom",
+    "last": "last", "hottest": "hottest", "coldest": "coldest", "nominate": "nominate",
+    "nominated": "nominate", "impeach": "impeach", "impeached": "impeach", "removed": "remove",
+    "remove": "remove", "resign": "resign", "release": "release", "announce": "announce",
+}
+NEGATIONS = {"no", "not", "none", "never", "without", "fail", "fails"}
+SUB_FILLER = set("above below yes at least or more less exactly between before after "
+                 "than over under the a an of in on to and".split())
+
+
+def stems(text):
+    text = re.sub(r"\bno change\b", "unchanged", text.lower())
+    return {re.sub(r"(?<=[a-z]{3})(es|s)$", "", w) for w in re.sub(r"[^a-z0-9 ]+", " ", text).split()}
+
+
+def title_conflicts(k, p):
+    """Notes for title-level signs that two matched markets ask different things."""
+    kt, pt = stems(k["title"]), stems(p["title"])
+    notes = []
+    # Kalshi's yes_sub_title names the specific outcome ("Noah Wyle", "PSG");
+    # it must show up somewhere on the Polymarket side
+    sub = {w for w in stems(k.get("sub") or "") - SUB_FILLER if not re.fullmatch(r"[\d.]+", w)}
+    pside = pt | stems(p.get("rules") or "")
+    if sub and not sub <= pside:
+        notes.append(f"Kalshi outcome \"{k['sub']}\" not found in Polymarket market")
+    # Polymarket game markets are often titled just "Will Australia win?" with
+    # the opponent only in the event title; both teams must appear on Kalshi
+    game = re.search(r"([^:]+?)\s+vs\.?\s+([^:(]+?)(?:\s+-\s+.*|\s*[:(].*)?$", p.get("event") or "")
+    if game:
+        kside = kt | stems(k.get("rules") or "")
+        missing = [t.strip() for t in game.groups() if not (stems(t) - SUB_FILLER) & kside]
+        if missing:
+            notes.append(f"Polymarket game \"{p['event']}\": {', '.join(missing)} not mentioned on Kalshi")
+    # Only compare when both titles name an outcome: "be the champion" vs
+    # "win the championship" is the same question phrased differently
+    ko = {OUTCOME_WORDS[w] for w in kt if w in OUTCOME_WORDS}
+    po = {OUTCOME_WORDS[w] for w in pt if w in OUTCOME_WORDS}
+    if ko and po and ko != po:
+        notes.append("titles ask different things: Kalshi " + (", ".join(sorted(ko - po)) or "-")
+                     + " vs Polymarket " + (", ".join(sorted(po - ko)) or "-"))
+    if bool(kt & NEGATIONS) != bool(pt & NEGATIONS):
+        notes.append("one title is negated (\"no\"/\"not\") and the other isn't")
+    return notes
+
+
+GENERIC = set("""will 2026 2027 2028 2026-27 season year wins happen next official officially reach
+make become named announce before after during until than more less above below over under between
+least most there have been being their they which what when where with from into about against""".split())
+
+
+def title_gaps(k, p):
+    """Distinctive title words that never appear on the other side (title or
+    rules), e.g. Kalshi "Bundesliga" vs Polymarket "DFB-Pokal"."""
+    def sig(t):
+        return {w for w in re.sub(r"[^a-z0-9 ]+", " ", t.lower()).split()
+                if len(w) > 3 and w not in GENERIC and w not in STOP and not w.isdigit()}
+    ktext = (k["title"] + " " + (k.get("rules") or "")).lower()
+    ptext = " ".join([p["title"], p.get("rules") or "", p.get("source") or ""]).lower()
+    k_only = sorted(w for w in sig(k["title"].split(" — ")[0]) if w not in ptext)
+    p_only = sorted(w for w in sig(p["title"]) if w not in ktext)
+    return k_only, p_only
 
 
 def key_numbers(text):
@@ -288,6 +388,16 @@ def rules_check(k, p):
         if level == "mismatch" or status == "ok":
             status = level
 
+    for note in title_conflicts(k, p):
+        flag("mismatch", note)
+    k_only, p_only = title_gaps(k, p)
+    if k_only or p_only:
+        gap = ("Kalshi title words missing from Polymarket: " + ", ".join(k_only) if k_only else "") + \
+              ("; " if k_only and p_only else "") + \
+              ("Polymarket title words missing from Kalshi: " + ", ".join(p_only) if p_only else "")
+        # Each side naming something the other never mentions is almost always
+        # two different questions; one-sided gaps are often just paraphrase
+        flag("mismatch" if k_only and p_only else "review", gap)
     if not kr or not pr:
         flag("review", "rules text missing on " + ("Kalshi" if not kr else "Polymarket") + " — read manually")
     # Every threshold in one market should show up somewhere in the other
@@ -358,7 +468,7 @@ def poly_asks(yes_token):
             "no_ask": sorted((round(1 - p, 4), s) for p, s in _levels(data.get("bids")))}
 
 
-def walk_books(k_ladder, p_ladder, poly_fee, min_edge, max_contracts):
+def walk_books(k_ladder, p_ladder, poly_rate, min_edge, max_contracts):
     """Buy one contract on each leg at a time, cheapest first, while the next
     contract still clears min_edge after fees.
 
@@ -371,12 +481,13 @@ def walk_books(k_ladder, p_ladder, poly_fee, min_edge, max_contracts):
     n = base = kfee_raw = 0.0
     while ki < len(k) and pi < len(p) and n < max_contracts:
         kp, pp = k[ki][0], p[pi][0]
-        unit = kp + 0.07 * kp * (1 - kp) + pp * (1 + poly_fee)
+        pp_all_in = pp + poly_fee(pp, poly_rate)
+        unit = kp + 0.07 * kp * (1 - kp) + pp_all_in
         if 1 - unit < min_edge:
             break
         q = min(k[ki][1], p[pi][1], max_contracts - n)
         n += q
-        base += q * (kp + pp * (1 + poly_fee))
+        base += q * (kp + pp_all_in)
         kfee_raw += 0.07 * q * kp * (1 - kp)
         k[ki][1] -= q
         p[pi][1] -= q
@@ -399,7 +510,7 @@ def add_depth(row, k, p, poly_fee, min_edge, max_contracts):
     except Exception as e:  # noqa: BLE001
         row["depth_note"] = f"book fetch failed: {e}"
         return
-    n, cost = walk_books(kb[k_side], pb[p_side], poly_fee, min_edge, max_contracts)
+    n, cost = walk_books(kb[k_side], pb[p_side], poly_rate(p, poly_fee), min_edge, max_contracts)
     row["depth_contracts"] = round(n, 2)
     row["depth_cost_$"] = round(cost, 2)
     row["depth_profit_$"] = round(n - cost, 2)
@@ -416,7 +527,17 @@ def kalshi_fee(price, contracts=100):
     return total / contracts
 
 
-def evaluate(sim, k, p, poly_fee):
+def poly_fee(price, rate):
+    """Polymarket taker fee per share: rate * p * (1-p) in USDC (rate is per
+    market, e.g. 0.03-0.07; see docs.polymarket.com/trading/fees)."""
+    return rate * price * (1 - price)
+
+
+def poly_rate(p, override):
+    return p.get("fee_rate", 0) if override is None else override
+
+
+def evaluate(sim, k, p, poly_fee_override):
     now = datetime.now(timezone.utc)
     rows = []
     # Option A: YES on Kalshi + NO on Polymarket
@@ -424,7 +545,7 @@ def evaluate(sim, k, p, poly_fee):
     for label, k_side, p_side in (("YES Kalshi + NO Poly", "yes_ask", "no_ask"),
                                   ("NO Kalshi + YES Poly", "no_ask", "yes_ask")):
         kp, pp = k[k_side], p[p_side]
-        cost = kp + kalshi_fee(kp) + pp * (1 + poly_fee)
+        cost = kp + kalshi_fee(kp) + pp + poly_fee(pp, poly_rate(p, poly_fee_override))
         edge = 1 - cost
         close = max(filter(None, [parse_dt(k["close"]), parse_dt(p["close"])]), default=None)
         days = max((close - now).days, 1) if close else None
@@ -534,32 +655,43 @@ def main():
     ap.add_argument("--min-sim", type=float, default=0.55, help="title match threshold 0-1 (default 0.55)")
     ap.add_argument("--min-edge", type=float, default=0.01, help="highlight pairs with at least this profit per $1 (default 0.01)")
     ap.add_argument("--max-days-apart", type=int, default=7, help="max gap between close dates (default 7)")
-    ap.add_argument("--poly-fee", type=float, default=0.01, help="Polymarket fee as fraction of price (default 0.01; set 0 if you pay none)")
+    ap.add_argument("--poly-fee", type=float, default=None,
+                    help="override Polymarket's fee rate in rate*p*(1-p) (default: each market's own feeSchedule; 0 = no fees)")
     ap.add_argument("--show", type=int, default=25, help="rows to print (default 25)")
     ap.add_argument("--no-depth", action="store_true", help="skip order book lookups")
     ap.add_argument("--depth-top", type=int, default=40, help="check order books for at most this many pairs (default 40)")
     ap.add_argument("--max-contracts", type=float, default=1000, help="stop walking the books at this many contracts (default 1000)")
     a = ap.parse_args()
 
-    print("Fetching Kalshi...", file=sys.stderr)
+    t0 = time.time()
+
+    def stage(msg):
+        print(f"[{time.time() - t0:6.1f}s] {msg}", file=sys.stderr)
+
+    stage("Fetching Kalshi...")
     kalshi = fetch_kalshi()
-    print("Fetching Polymarket...", file=sys.stderr)
+    stage("Fetching Polymarket...")
     poly = fetch_polymarket()
-    print(f"Matching {len(kalshi)} Kalshi x {len(poly)} Polymarket markets...", file=sys.stderr)
+    stage(f"Matching {len(kalshi)} Kalshi x {len(poly)} Polymarket markets...")
 
     pairs = match(kalshi, poly, a.min_sim, a.max_days_apart)
+    stage(f"{len(pairs)} matched pairs")
     rows = sorted((evaluate(s, k, p, a.poly_fee) for s, k, p in pairs),
                   key=lambda r: r["profit_per_$1_payout"], reverse=True)
 
     # Deeper levels only cost more, so only pairs that clear the edge at the
     # top of the book can be worth walking.
     if not a.no_depth:
-        todo = [r for r in rows if r["profit_per_$1_payout"] >= a.min_edge
-                and r["rules_status"] != "mismatch"][: a.depth_top]
+        # Rows that passed the rules check first: on live data the biggest
+        # "review" edges are mostly near-miss matches, and would use up the budget
+        todo = sorted((r for r in rows if r["profit_per_$1_payout"] >= a.min_edge
+                       and r["rules_status"] != "mismatch"),
+                      key=lambda r: r["rules_status"] != "ok")[: a.depth_top]
         for i, r in enumerate(todo, 1):
             print(f"  order books {i}/{len(todo)}", file=sys.stderr)
             add_depth(r, r["_k"], r["_p"], a.poly_fee, a.min_edge, a.max_contracts)
 
+    stage("Writing output")
     write_csv(rows, "arb_opportunities.csv")
     write_html(rows, "arb_report.html", a.min_edge)
 
